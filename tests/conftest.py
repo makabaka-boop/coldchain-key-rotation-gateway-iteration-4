@@ -140,6 +140,10 @@ def retire(client, tenant_id):
     return client.post(f"/v1/tenants/{tenant_id}/keys/retire")
 
 
+def revoke(client, tenant_id, key_id):
+    return client.post(f"/v1/tenants/{tenant_id}/keys/{key_id}/revoke")
+
+
 def get_roles(client, tenant_id):
     resp = client.get(f"/v1/tenants/{tenant_id}/keys")
     assert resp.status_code == 200, resp.text

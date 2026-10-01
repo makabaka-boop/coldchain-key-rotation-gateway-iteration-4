@@ -10,6 +10,15 @@ Two contracts share one endpoint:
   one immutable receipt; byte-identical retries return that receipt even after
   the signing key is retired, while reusing the id with another key or body is
   a conflict. Retired keys may never sign new v2 messages.
+
+Revocation is arbitrated inside the same transaction and under the same
+per-tenant advisory lock as key transitions, so a verify can only be ordered
+strictly before or strictly after a revoke commits: a revoked key never gains
+a new receipt. Revocation rejects v1 requests and every v2 request (including
+byte-identical retries of previously accepted messages) with KEY_REVOKED;
+receipts created before the revocation stay queryable. For v2 the signature
+is still checked before the revocation gate and every receipt read, so an
+invalid signature cannot probe whether a message (or receipt) exists.
 """
 import hashlib
 import uuid
@@ -23,12 +32,26 @@ from . import db
 from .auth import require
 from .config import MAX_BODY_BYTES
 from .errors import ApiError
-from .keys import _ID_RE
+from .keys import _ID_RE, _lock_tenant
 from .util import b64url_decode_unpadded
 
 router = APIRouter(tags=["verify"])
 
 V2_DOMAIN = "coldchain-verify-v2"
+
+# Read the key together with its revocation marker. The advisory xact lock
+# taken just before this read is the same one key transitions take, so the
+# snapshot plus the lock order put this transaction wholly before or wholly
+# after any concurrent revoke/retire commit: a revoked key can never insert a
+# receipt after the revocation has committed.
+_KEY_LOOKUP_SQL = (
+    "SELECT k.role AS role, k.public_key AS public_key,"
+    " (r.revoked_at IS NOT NULL) AS revoked"
+    " FROM tenant_keys k"
+    " LEFT JOIN key_revocations r"
+    "   ON r.tenant_id = k.tenant_id AND r.key_id = k.key_id"
+    " WHERE k.tenant_id = $1 AND k.key_id = $2"
+)
 
 
 async def _read_body(request: Request) -> bytes:
@@ -103,24 +126,27 @@ def _parse_headers(request: Request):
 
 
 async def _verify_v1(conn, tenant_id: str, key_id: str, signature: bytes, body: bytes) -> str:
-    # The role read is the ordering point against a concurrent retire: a
-    # snapshot taken before the retire commits may still verify; one taken
-    # after observes 'retired' and fails with KEY_RETIRED.
-    row = await conn.fetchrow(
-        "SELECT role, public_key FROM tenant_keys WHERE tenant_id = $1 AND key_id = $2",
-        tenant_id, key_id,
-    )
+    # Serialize against every key transition (revoke included) for this
+    # tenant; the key read is then the single ordering point. A snapshot taken
+    # before a retire/revoke commits may still verify; one taken after
+    # observes the new state and fails.
+    await _lock_tenant(conn, tenant_id)
+    row = await conn.fetchrow(_KEY_LOOKUP_SQL, tenant_id, key_id)
     if row is None:
         # Unknown key ids and other tenants' keys are indistinguishable.
         raise ApiError(404, "KEY_UNKNOWN")
+    if row["revoked"]:
+        # Revocation rejects all new v1 requests; nothing is inserted.
+        raise ApiError(410, "KEY_REVOKED")
     if row["role"] == "retired":
         raise ApiError(410, "KEY_RETIRED")
     _verify_signature(bytes(row["public_key"]), signature, body)
 
     receipt_id = uuid.uuid4()
     await conn.execute(
-        "INSERT INTO receipts (receipt_id, tenant_id, key_id, body_sha256, body_size)"
-        " VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO receipts (receipt_id, tenant_id, key_id, body_sha256,"
+        " body_size, created_at)"
+        " VALUES ($1, $2, $3, $4, $5, clock_timestamp())",
         receipt_id, tenant_id, key_id, hashlib.sha256(body).digest(), len(body),
     )
     return str(receipt_id)
@@ -134,19 +160,27 @@ async def _verify_v2(
     All reads and the insert happen in one transaction: any error rolls the
     transaction back, so rejected requests never leave a placeholder row.
     """
-    row = await conn.fetchrow(
-        "SELECT role, public_key FROM tenant_keys WHERE tenant_id = $1 AND key_id = $2",
-        tenant_id, key_id,
-    )
+    # The same tenant advisory lock the key transitions take is acquired
+    # first, so this transaction is ordered as a whole strictly before or
+    # after a concurrent revoke/retire commit -- never across the boundary.
+    await _lock_tenant(conn, tenant_id)
+    row = await conn.fetchrow(_KEY_LOOKUP_SQL, tenant_id, key_id)
     if row is None:
         # Unknown key ids and other tenants' keys are indistinguishable.
         raise ApiError(404, "KEY_UNKNOWN")
 
-    # The signature is checked *before* any receipt state is consulted, so an
-    # invalid signature is always BAD_SIGNATURE and the response cannot reveal
-    # whether the message id already exists.
+    # The signature is checked *before* the revocation gate and any receipt
+    # state is consulted, so an invalid signature always answers BAD_SIGNATURE
+    # and the response cannot reveal whether the key was revoked or whether the
+    # message id already exists.
     canonical = v2_canonical_message(tenant_id, key_id, message_id, body)
     _verify_signature(bytes(row["public_key"]), signature, canonical)
+
+    # Revocation dominates the receipt lookup: even a byte-identical retry of
+    # a message accepted before the revocation is refused, and no new receipt
+    # can be created with a revoked key.
+    if row["revoked"]:
+        raise ApiError(410, "KEY_REVOKED")
 
     body_digest = hashlib.sha256(body).digest()
 
@@ -158,7 +192,8 @@ async def _verify_v2(
     if existing is not None:
         if existing["key_id"] == key_id and bytes(existing["body_sha256"]) == body_digest:
             # Exact retry (same key, same body): the original receipt is
-            # authoritative even when the key has since been retired.
+            # authoritative even when the key has since been retired (but not
+            # revoked -- that case is rejected above).
             return 200, str(existing["receipt_id"])
         # Same id, different content or key: answer generically so the stored
         # receipt's contents are not disclosed.
@@ -171,8 +206,8 @@ async def _verify_v2(
     receipt_id = uuid.uuid4()
     inserted = await conn.fetchval(
         "INSERT INTO v2_receipts (receipt_id, tenant_id, message_id, key_id,"
-        " body_sha256, body_size)"
-        " VALUES ($1, $2, $3, $4, $5, $6)"
+        " body_sha256, body_size, created_at)"
+        " VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())"
         " ON CONFLICT (tenant_id, message_id) DO NOTHING"
         " RETURNING receipt_id",
         receipt_id, tenant_id, message_id, key_id, body_digest, len(body),

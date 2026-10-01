@@ -220,7 +220,7 @@ async def issue_challenge(tenant_id: str, _: None = Depends(require("keys:manage
             if policy is None or not policy["pop_required"]:
                 raise ApiError(409, "POP_POLICY_DISABLED")
 
-            roles, _ = await _fetch_roles(conn, tenant_id)
+            roles, _, _ = await _fetch_roles(conn, tenant_id)
             if roles["candidate"] is None:
                 raise ApiError(409, "ILLEGAL_TRANSITION", roles=roles)
 
@@ -321,7 +321,7 @@ async def answer_challenge(
             elif row["status"] == "answered":
                 raise ApiError(409, "POP_PROOF_DUPLICATE", challengeId=challenge_id)
             else:
-                roles, _ = await _fetch_roles(conn, tenant_id)
+                roles, _, _ = await _fetch_roles(conn, tenant_id)
                 context_ok = (
                     roles["candidate"] == row["candidate_key_id"]
                     and roles["current"] == row["current_key_id"]

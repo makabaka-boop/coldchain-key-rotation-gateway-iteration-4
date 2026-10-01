@@ -16,6 +16,22 @@ CREATE TABLE IF NOT EXISTS tenant_keys (
     PRIMARY KEY (tenant_id, key_id)
 );
 
+-- Irreversible key revocation, orthogonal to the four roles. A row's mere
+-- existence means the key is revoked; revoked_at is the durable revocation
+-- time. Revocation never deletes a key (historical role views and receipts
+-- stay intact) and never deletes itself: there is no operation that removes
+-- a row. A revoked candidate is moved to role 'retired' so its candidate
+-- seat is released immediately; revoked current/retiring keys keep their
+-- roles and the ordinary promote/retire flow keeps working.
+CREATE TABLE IF NOT EXISTS key_revocations (
+    tenant_id   TEXT        NOT NULL,
+    key_id      TEXT        NOT NULL,
+    revoked_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, key_id),
+    FOREIGN KEY (tenant_id, key_id)
+        REFERENCES tenant_keys (tenant_id, key_id)
+);
+
 -- Invariants, enforced at the storage layer: per tenant at most one key per
 -- in-use role. 'retired' is unbounded.
 CREATE UNIQUE INDEX IF NOT EXISTS tenant_keys_one_current
