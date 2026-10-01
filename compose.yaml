@@ -1,0 +1,87 @@
+name: coldchain-gateway
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: coldchain
+      POSTGRES_PASSWORD: coldchain
+      POSTGRES_DB: coldchain
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldchain -d coldchain"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      # The virtual-clock control plane is off in normal deployments; the
+      # acceptance profile switches it on via CLOCK_CONTROL_ENABLED=1.
+      CLOCK_CONTROL_ENABLED: ${CLOCK_CONTROL_ENABLED:-0}
+    ports:
+      # 宿主机端口只能由 API_PORT 给出；未设置时 compose 直接报错，不占用任何默认端口。
+      - "${API_PORT:?API_PORT must be set, e.g. 'API_PORT=8080 docker compose up'}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Second stateless instance: acceptance drives it together with `api` so the
+  # shared clock, one-time proofs and promotion races are covered across two
+  # replicas. Not started by `up` unless explicitly named or pulled in by
+  # `verify` (see below).
+  api2:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      CLOCK_CONTROL_ENABLED: 1
+    ports:
+      - "${API_PORT2:-8002}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["verify"]
+
+  verify:
+    build: .
+    command: ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+    environment:
+      # The clock control plane is enabled on api2; the primary instance
+      # (BASE_URL) therefore points there, while races also touch `api`.
+      API_BASE_URL: http://api2:8000
+      API_BASE2_URL: http://api:8000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      # Real-database checks (unique-constraint backstop) connect directly.
+      DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
+    depends_on:
+      api:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    profiles: ["verify"]
+
+volumes:
+  db-data:
