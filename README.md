@@ -32,8 +32,46 @@
   按租户串行化，迁移在提交前对其他事务不可见。
 - 三个部分唯一索引（每租户每在用角色至多一行）作为兜底：任何残余竞态都会退化为
   唯一约束冲突并返回 409。
-- 验签以**单次角色读取为排序点**：快照早于退休提交则可验签成功，晚于退休提交则返回
-  `KEY_RETIRED`。两种结果都正确，取决于排序点落在哪一侧。
+- 验签在事务内取同一把锁的**共享模式**（验签之间互不阻塞，但与任何迁移/吊销互斥），
+  锁获取即排序点：验签要么在迁移提交前完成（其回执归属迁移前的世界），要么观察到
+  迁移后的状态并被拒。两种结果都正确，取决于排序点落在哪一侧。
+
+## 密钥吊销（泄漏应急）
+
+私钥疑似泄露时，管理员必须能立即阻断它继续验签——包括借 v2 原消息编号重试取回旧回执。
+吊销是按租户、按密钥执行的**不可逆**操作，在密钥行上持久记录 `revoked_at`；
+它独立于当前 / 候选 / 退役中 / 已退休四种角色，与轮换流程正交。
+
+```http
+POST /v1/tenants/{tenantId}/keys/{keyId}/revoke
+Authorization: Bearer <admin-token>
+
+# 200
+{"tenantId": "t1", "keyId": "k-2026-01", "revokedAt": "2026-10-01T08:30:00.123456+00:00",
+ "alreadyRevoked": false,
+ "roles": {"current": "k-2026-01", "candidate": null, "retiring": null}}
+```
+
+- **与角色的关系**：吊销候选钥时，同事务内将其角色转为已退休，**立即释放候选席位**
+  以便补录新候选（已吊销的候选因此永不可能被提升；存储层 CHECK 约束兜底
+  “候选不得处于吊销态”），其未决的持钥证明挑战同事务关闭。吊销当前钥、退役中钥
+  或已退休钥只打吊销标记，角色不变——已吊销的当前钥仍按原轮换流程由新候选接替。
+- **验签侧**：吊销与收据在同一数据库裁决边界内判定。吊销前已经成立的回执仍可供
+  管理员查询；吊销提交后，该钥的 v1 新请求、v2 原样重试与新消息一律返回稳定的
+  **410 `KEY_REVOKED`**，不产生新回执。检查先于签名验证与收据查询，因此坏签名
+  与好签名、已存在的消息编号与新编号得到完全相同的拒绝，无法借错误差异探测
+  消息是否存在。
+- **交错归属**：吊销取租户排他锁，验签取共享锁，二者互斥。两实例上验签与吊销
+  交错时，每个验签请求要么整体落在吊销前（回执的 `createdAt` 必然早于
+  `revokedAt`），要么落在吊销后被拒——不会出现“吊销已提交却新增收据”。
+- **幂等**：重复吊销返回 200 且 `alreadyRevoked: true`，`revokedAt` 保持首次时间；
+  keyId 未知或属于其他租户统一返回 404 `KEY_UNKNOWN`。失败路径不改变任何状态。
+- 吊销时间取数据库真实时钟（`clock_timestamp()`），与回执时间同源可比；
+  迁移为既有 `tenant_keys` 表增补 `revoked_at` 列，保留全部旧密钥与收据，
+  未吊销密钥的退役重试语义不变。
+
+权威角色视图 `GET /v1/tenants/{tenantId}/keys` 额外返回 `revoked` 列表
+（`[{"keyId", "revokedAt"}]`，按吊销时间排序）。
 
 ## 提升前持钥证明（可选租户策略）
 
@@ -107,7 +145,8 @@ body_sha256=<请求体 SHA-256 的小写十六进制>
   （含消息 ID、keyId、报文 SHA-256 与大小），此后不可变。
 - **内容与签名完全相同的重试**：同租户、同消息 ID、同 keyId、同体摘要 → **200**
   `{"receiptId": <原收据>, "duplicate": true}`，不新增收据；**即使该密钥随后已退役**
-  （retired），既有消息的原样重试仍返回原收据。
+  （retired），既有消息的原样重试仍返回原收据。密钥一旦被**吊销**则不再适用：
+  原样重试与新消息一样返回 410 `KEY_REVOKED`（见“密钥吊销”）。
 - **相同 ID 携带不同报文或不同密钥** → **409 `MESSAGE_CONFLICT`**（仅回显消息 ID，
   不泄露既有内容）。轮换密钥不能让旧消息 ID 在新钥下复用——消息 ID 不会成为绕过轮换的入口。
 - **退役钥不得开启新消息**：消息 ID 无既有收据且密钥已 retired → **410 `KEY_RETIRED`**。
@@ -139,7 +178,8 @@ body_sha256=<请求体 SHA-256 的小写十六进制>
 | POST | `/v1/tenants/{tenantId}/keys` | `keys:manage` | 登记公钥（201） |
 | POST | `/v1/tenants/{tenantId}/keys/promote` | `keys:manage` | 提升候选（200） |
 | POST | `/v1/tenants/{tenantId}/keys/retire` | `keys:manage` | 退休退役中钥（200） |
-| GET | `/v1/tenants/{tenantId}/keys` | `keys:manage` | 权威角色视图（含已退休列表） |
+| POST | `/v1/tenants/{tenantId}/keys/{keyId}/revoke` | `keys:manage` | 不可逆吊销（200，幂等） |
+| GET | `/v1/tenants/{tenantId}/keys` | `keys:manage` | 权威角色视图（含已退休与已吊销列表） |
 | GET | `/v1/tenants/{tenantId}/receipts` | `keys:manage` | 回执列表 |
 | GET/PUT | `/v1/tenants/{tenantId}/policy` | `keys:manage` | 查看/设置租户 PoP 策略 |
 | POST | `/v1/tenants/{tenantId}/pop-challenges` | `keys:manage` | 为当前候选钥申请一次性挑战（201） |
@@ -244,6 +284,7 @@ X-Signature: <64 字节 Ed25519 签名，无填充 base64url，覆盖原始请�
 | 409 | `POP_PROOF_MISMATCH` | 证明绑定的候选/当前钥或代次已变化（附权威 `roles`） |
 | 409 | `MESSAGE_CONFLICT` | v2：同租户同消息 ID 已被不同内容或不同密钥占用（仅回显 `messageId`） |
 | 410 | `KEY_RETIRED` | 读取快照晚于退休提交 |
+| 410 | `KEY_REVOKED` | 密钥已吊销：v1 新请求、v2 原样重试与新消息的稳定拒绝（不产生回执） |
 | 410 | `POP_CHALLENGE_EXPIRED` / `POP_PROOF_EXPIRED` | 挑战应答前过期 / 证明提升前过期（后者附 `roles`） |
 | 413 | `PAYLOAD_TOO_LARGE` | 报文超过 1048576 字节 |
 

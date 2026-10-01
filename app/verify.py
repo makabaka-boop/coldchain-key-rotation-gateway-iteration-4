@@ -10,6 +10,13 @@ Two contracts share one endpoint:
   one immutable receipt; byte-identical retries return that receipt even after
   the signing key is retired, while reusing the id with another key or body is
   a conflict. Retired keys may never sign new v2 messages.
+
+Independently of either contract, a revoked key is always refused with
+KEY_REVOKED — v1 requests, v2 exact retries and new v2 messages alike — and
+never produces a new receipt. The revocation check, the signature check and
+the receipt read/write share one transaction guarded by the tenant's shared
+advisory lock, so every request lands unambiguously on one side of a
+concurrent revocation.
 """
 import hashlib
 import uuid
@@ -23,7 +30,7 @@ from . import db
 from .auth import require
 from .config import MAX_BODY_BYTES
 from .errors import ApiError
-from .keys import _ID_RE
+from .keys import _ID_RE, _lock_tenant_shared
 from .util import b64url_decode_unpadded
 
 router = APIRouter(tags=["verify"])
@@ -103,16 +110,21 @@ def _parse_headers(request: Request):
 
 
 async def _verify_v1(conn, tenant_id: str, key_id: str, signature: bytes, body: bytes) -> str:
-    # The role read is the ordering point against a concurrent retire: a
-    # snapshot taken before the retire commits may still verify; one taken
-    # after observes 'retired' and fails with KEY_RETIRED.
+    # The shared tenant lock is the ordering point against a concurrent
+    # revoke/retire: those transitions hold the lock exclusively, so this
+    # transaction either completes before the transition commits (its receipt
+    # then belongs to the pre-transition world) or observes the
+    # post-transition state and is refused.
+    await _lock_tenant_shared(conn, tenant_id)
     row = await conn.fetchrow(
-        "SELECT role, public_key FROM tenant_keys WHERE tenant_id = $1 AND key_id = $2",
+        "SELECT role, public_key, revoked_at FROM tenant_keys"
+        " WHERE tenant_id = $1 AND key_id = $2",
         tenant_id, key_id,
     )
     if row is None:
         # Unknown key ids and other tenants' keys are indistinguishable.
         raise ApiError(404, "KEY_UNKNOWN")
+    _check_not_revoked(row)
     if row["role"] == "retired":
         raise ApiError(410, "KEY_RETIRED")
     _verify_signature(bytes(row["public_key"]), signature, body)
@@ -126,6 +138,15 @@ async def _verify_v1(conn, tenant_id: str, key_id: str, signature: bytes, body: 
     return str(receipt_id)
 
 
+def _check_not_revoked(row) -> None:
+    """Revocation is a security decision, checked before anything else: every
+    request on a revoked key — valid or forged signature, known or fresh
+    message id — gets the same stable refusal and no receipt, so the response
+    cannot be used to probe whether a message id exists."""
+    if row["revoked_at"] is not None:
+        raise ApiError(410, "KEY_REVOKED")
+
+
 async def _verify_v2(
     conn, tenant_id: str, key_id: str, message_id: str, signature: bytes, body: bytes
 ) -> tuple[int, str]:
@@ -134,13 +155,20 @@ async def _verify_v2(
     All reads and the insert happen in one transaction: any error rolls the
     transaction back, so rejected requests never leave a placeholder row.
     """
+    await _lock_tenant_shared(conn, tenant_id)
     row = await conn.fetchrow(
-        "SELECT role, public_key FROM tenant_keys WHERE tenant_id = $1 AND key_id = $2",
+        "SELECT role, public_key, revoked_at FROM tenant_keys"
+        " WHERE tenant_id = $1 AND key_id = $2",
         tenant_id, key_id,
     )
     if row is None:
         # Unknown key ids and other tenants' keys are indistinguishable.
         raise ApiError(404, "KEY_UNKNOWN")
+
+    # A revoked key is refused before the signature and before any receipt
+    # state is consulted: even an exact retry of a pre-revocation message can
+    # no longer fetch its receipt through this key.
+    _check_not_revoked(row)
 
     # The signature is checked *before* any receipt state is consulted, so an
     # invalid signature is always BAD_SIGNATURE and the response cannot reveal

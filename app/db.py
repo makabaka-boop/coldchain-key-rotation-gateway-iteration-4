@@ -11,10 +11,33 @@ CREATE TABLE IF NOT EXISTS tenant_keys (
     key_id      TEXT        NOT NULL,
     role        TEXT        NOT NULL CHECK (role IN ('current', 'candidate', 'retiring', 'retired')),
     public_key  BYTEA       NOT NULL CHECK (octet_length(public_key) = 32),
+    revoked_at  TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (tenant_id, key_id)
+    PRIMARY KEY (tenant_id, key_id),
+    CONSTRAINT tenant_keys_candidate_not_revoked
+        CHECK (role <> 'candidate' OR revoked_at IS NULL)
 );
+
+-- Migration for existing deployments: revocation is orthogonal to the role
+-- state machine, recorded as a timestamp on the key row itself. Adding the
+-- column preserves every existing key and receipt; NULL means "not revoked".
+ALTER TABLE tenant_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+
+-- Storage-layer backstop for the seat-release rule: a revoked candidate is
+-- moved out of the candidate role in the same transaction, so a row can never
+-- be both 'candidate' and revoked. (ADD CONSTRAINT has no IF NOT EXISTS.)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'tenant_keys_candidate_not_revoked'
+          AND conrelid = 'tenant_keys'::regclass
+    ) THEN
+        ALTER TABLE tenant_keys ADD CONSTRAINT tenant_keys_candidate_not_revoked
+            CHECK (role <> 'candidate' OR revoked_at IS NULL);
+    END IF;
+END $$;
 
 -- Invariants, enforced at the storage layer: per tenant at most one key per
 -- in-use role. 'retired' is unbounded.

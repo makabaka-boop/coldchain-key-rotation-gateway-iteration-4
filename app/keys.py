@@ -1,4 +1,4 @@
-"""Tenant key lifecycle: register, promote, retire, inspect."""
+"""Tenant key lifecycle: register, promote, retire, revoke, inspect."""
 import re
 
 import asyncpg
@@ -25,17 +25,22 @@ class RegisterKeyRequest(BaseModel):
 def _roles_from_rows(rows):
     roles = {role: None for role in _ACTIVE_ROLES}
     retired = []
+    revoked = []
     for row in rows:
+        if row["revoked_at"] is not None:
+            revoked.append((row["key_id"], row["revoked_at"]))
         if row["role"] == "retired":
             retired.append(row["key_id"])
         else:
             roles[row["role"]] = row["key_id"]
-    return roles, retired
+    revoked.sort(key=lambda item: item[1])
+    return roles, retired, revoked
 
 
 async def _fetch_roles(conn, tenant_id: str):
     rows = await conn.fetch(
-        "SELECT key_id, role FROM tenant_keys WHERE tenant_id = $1 ORDER BY created_at, key_id",
+        "SELECT key_id, role, revoked_at FROM tenant_keys"
+        " WHERE tenant_id = $1 ORDER BY created_at, key_id",
         tenant_id,
     )
     return _roles_from_rows(rows)
@@ -46,6 +51,18 @@ async def _lock_tenant(conn, tenant_id: str) -> None:
     # transaction; the partial unique indexes are the backstop.
     await conn.execute(
         "SELECT pg_advisory_xact_lock(hashtext('tenant_keys'), hashtext($1))",
+        tenant_id,
+    )
+
+
+async def _lock_tenant_shared(conn, tenant_id: str) -> None:
+    # Verification takes the same lock in shared mode: concurrent verifies do
+    # not block each other, but any key-state transition (exclusive, above) is
+    # mutually exclusive with every in-flight verify. A committed revoke can
+    # therefore never be followed by a new receipt from a straggling verify
+    # transaction — every verify lands on exactly one side of the transition.
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock_shared(hashtext('tenant_keys'), hashtext($1))",
         tenant_id,
     )
 
@@ -75,10 +92,11 @@ async def register_key(
             async with conn.transaction():
                 await _lock_tenant(conn, tenant_id)
                 rows = await conn.fetch(
-                    "SELECT key_id, role FROM tenant_keys WHERE tenant_id = $1 FOR UPDATE",
+                    "SELECT key_id, role, revoked_at FROM tenant_keys"
+                    " WHERE tenant_id = $1 FOR UPDATE",
                     tenant_id,
                 )
-                roles, _ = _roles_from_rows(rows)
+                roles, _, _ = _roles_from_rows(rows)
                 if any(row["key_id"] == body.keyId for row in rows):
                     raise ApiError(409, "KEY_ALREADY_EXISTS", roles=roles)
                 if not rows:
@@ -106,7 +124,7 @@ async def register_key(
         # Lost a race against a concurrent transition; answer with the
         # authoritative roles so the caller can resync.
         async with db.pool.acquire() as conn:
-            roles, _ = await _fetch_roles(conn, tenant_id)
+            roles, _, _ = await _fetch_roles(conn, tenant_id)
         raise ApiError(409, "KEY_ALREADY_EXISTS", roles=roles) from None
 
 
@@ -122,7 +140,7 @@ async def promote_key(tenant_id: str, _: None = Depends(require("keys:manage")))
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await _lock_tenant(conn, tenant_id)
-            roles, _ = await _fetch_roles(conn, tenant_id)
+            roles, _, _ = await _fetch_roles(conn, tenant_id)
             if roles["candidate"] is None or roles["retiring"] is not None:
                 raise ApiError(409, "ILLEGAL_TRANSITION", roles=roles)
 
@@ -165,7 +183,7 @@ async def retire_key(tenant_id: str, _: None = Depends(require("keys:manage"))):
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await _lock_tenant(conn, tenant_id)
-            roles, retired = await _fetch_roles(conn, tenant_id)
+            roles, retired, _ = await _fetch_roles(conn, tenant_id)
             if roles["retiring"] is None:
                 raise ApiError(409, "ILLEGAL_TRANSITION", roles=roles)
             await conn.execute(
@@ -178,13 +196,89 @@ async def retire_key(tenant_id: str, _: None = Depends(require("keys:manage"))):
             return {"tenantId": tenant_id, "roles": roles, "retired": retired}
 
 
+@router.post("/tenants/{tenant_id}/keys/{key_id}/revoke")
+async def revoke_key(
+    tenant_id: str,
+    key_id: str,
+    _: None = Depends(require("keys:manage")),
+):
+    """Irreversibly revoke a key whose private part may have leaked.
+
+    Revocation is orthogonal to the role state machine and persists
+    `revoked_at`. A revoked candidate is moved to 'retired' in the same
+    transaction, releasing the candidate seat for a replacement; a revoked
+    current key keeps its role and is replaced through the normal rotation
+    flow. Receipts issued before the revocation stay queryable; afterwards
+    every verification for the key — v1, v2 exact retry or new message — is
+    refused with a stable KEY_REVOKED and produces no new receipt.
+    """
+    _check_ids(tenant_id, key_id)
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            await _lock_tenant(conn, tenant_id)
+            row = await conn.fetchrow(
+                "SELECT key_id, role, revoked_at FROM tenant_keys"
+                " WHERE tenant_id = $1 AND key_id = $2 FOR UPDATE",
+                tenant_id, key_id,
+            )
+            if row is None:
+                # Unknown key ids and other tenants' keys are indistinguishable.
+                raise ApiError(404, "KEY_UNKNOWN")
+            if row["revoked_at"] is not None:
+                # Idempotent: the first revocation time stays authoritative.
+                roles, _, _ = await _fetch_roles(conn, tenant_id)
+                return {
+                    "tenantId": tenant_id,
+                    "keyId": key_id,
+                    "revokedAt": row["revoked_at"].isoformat(),
+                    "alreadyRevoked": True,
+                    "roles": roles,
+                }
+            # clock_timestamp() (not the transaction's now()): the decision is
+            # stamped when this lock holder actually writes, which is strictly
+            # after any receipt committed by a verify transaction that held the
+            # shared lock before us — so no receipt can post-date revocation.
+            new_role = "retired" if row["role"] == "candidate" else row["role"]
+            revoked_at = await conn.fetchval(
+                "UPDATE tenant_keys SET revoked_at = clock_timestamp(), role = $3,"
+                " updated_at = now()"
+                " WHERE tenant_id = $1 AND key_id = $2 RETURNING revoked_at",
+                tenant_id, key_id, new_role,
+            )
+            if row["role"] == "candidate":
+                # The seat is released; this candidate's outstanding proofs can
+                # never be consumed, so close them out in the same transaction.
+                await conn.execute(
+                    "UPDATE pop_challenges SET status = 'expired'"
+                    " WHERE tenant_id = $1 AND candidate_key_id = $2"
+                    " AND status IN ('issued', 'answered')",
+                    tenant_id, key_id,
+                )
+            roles, _, _ = await _fetch_roles(conn, tenant_id)
+            return {
+                "tenantId": tenant_id,
+                "keyId": key_id,
+                "revokedAt": revoked_at.isoformat(),
+                "alreadyRevoked": False,
+                "roles": roles,
+            }
+
+
 @router.get("/tenants/{tenant_id}/keys")
 async def list_keys(tenant_id: str, _: None = Depends(require("keys:manage"))):
     """Authoritative role view for a tenant."""
     _check_ids(tenant_id)
     async with db.pool.acquire() as conn:
-        roles, retired = await _fetch_roles(conn, tenant_id)
-    return {"tenantId": tenant_id, "roles": roles, "retired": retired}
+        roles, retired, revoked = await _fetch_roles(conn, tenant_id)
+    return {
+        "tenantId": tenant_id,
+        "roles": roles,
+        "retired": retired,
+        "revoked": [
+            {"keyId": key_id, "revokedAt": revoked_at.isoformat()}
+            for key_id, revoked_at in revoked
+        ],
+    }
 
 
 @router.get("/tenants/{tenant_id}/receipts")
